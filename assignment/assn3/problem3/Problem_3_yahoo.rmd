@@ -1,0 +1,117 @@
+---
+title: "Stock Price from Yahoo Extraction"
+author: "Andrea Wang"
+date: "2025-09-30"
+output: html_document
+---
+```{r setup, include=FALSE}
+# install.packages(c("tidyquant","BatchGetSymbols","tidyverse","rvest","httr","dplyr","stringr","readr"))
+library(tidyquant)
+library(BatchGetSymbols)
+library(tidyverse)
+library(rvest)
+library(httr)
+library(dplyr)
+library(stringr)
+library(readr)
+```
+
+```{r sp500_member}
+####### Get current S&P500 membership with sectors #######
+# Returns a tibble with columns: symbol, company, sector
+get_sp500_with_sectors <- function() {
+  url <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+  pg  <- GET(url, user_agent("Mozilla/5.0"))      
+  tab <- html_table(read_html(pg) |> html_element("table.wikitable"), fill = TRUE)
+
+  tibble(
+    symbol  = str_replace(tab$Symbol, "\\.", "-"),  # BRK.B -> BRK-B for Yahoo
+    company = tab$Security,
+    sector  = tab$`GICS Sector`
+  )
+}
+
+members <- get_sp500_with_sectors()
+head(members)
+write_csv(members,   "sp500_meta.csv") 
+```
+
+
+```{r get_price_function}
+####### Download **raw prices** (adjusted by default) for any tickers #######
+# Returns a wide tibble: first column \code{date}, remaining columns one per ticker.
+
+# @param tickers Character vector of ticker symbols.
+# @param start Start date (Date). Default \code{as.Date("2019-01-01")}.
+# @param end End date (Date). Default \code{Sys.Date()}.
+# @param freq One of \code{"daily"}, \code{"weekly"}, \code{"monthly"}.
+# @param price_col Which price column to return:
+#   \itemize{
+#     \item \code{"price.adjusted"} (default): split/dividend-adjusted close (recommended).
+#     \item \code{"price.close"}: unadjusted closing price.
+#   }
+# @param cache_dir Directory path for on-disk cache (created if missing).
+#   Set to \code{NULL} to disable caching.
+# @param join How to align dates across tickers in the wide result:
+#   \itemize{
+#     \item \code{"outer"} (default): keep all dates; missing values left as NA.
+#     \item \code{"inner"}: keep only dates present for **all** tickers (drop rows with any NA).
+#'   }
+#'
+get_prices_yahoo <- function(tickers,
+                             start = as.Date("2019-01-01"),
+                             end   = Sys.Date(),
+                             freq  = c("daily","weekly","monthly"),
+                             price_col = c("price.adjusted","price.close"),
+                             cache_dir  = file.path(getwd(), "bg_cache"),
+                             join = c("outer","inner")) {
+  freq      <- match.arg(freq)
+  price_col <- match.arg(price_col)
+  join      <- match.arg(join)
+
+  bg <- BatchGetSymbols(
+    tickers      = unique(tickers),
+    first.date   = start,
+    last.date    = end,
+    freq.data    = freq,
+    cache.folder = cache_dir,      # on-disk cache to avoid re-downloads
+    thresh.bad.data = 0.95         # keep tickers with ≥95% trading days
+  )
+
+  prices_long <- bg$df.tickers |>
+    select(ref.date, ticker, all_of(price_col)) |>
+    rename(date = ref.date, price = !!price_col) |>
+    distinct(date, ticker, .keep_all = TRUE) |>
+    arrange(date, ticker)
+
+  prices_wide <- prices_long |>
+    pivot_wider(names_from = ticker, values_from = price) |>
+    arrange(date)
+
+  if (join == "inner") {
+    prices_wide <- drop_na(prices_wide)  # keep only dates present for all tickers
+  }
+  prices_wide
+}
+```
+
+
+```{r class example}
+etfs <- c(
+  EWJ="Japan", EWZ="Brazil", FXI="China", EWY="South Korea",
+  EWT="Taiwan", EWH="Hong Kong", EWC="Canada", EWG="Germany",
+  EWU="United Kingdom", EWA="Australia", EWW="Mexico", EWL="Switzerland",
+  EWP="Spain", EWQ="France", EIDO="Indonesia", ERUS="Russia",
+  EWS="Singapore", EWM="Malaysia", EZA="South Africa", THD="Thailand",
+  ECH="Chile", EWI="Italy", TUR="Turkey", EPOL="Poland",
+  EPHE="Philippines", EWD="Sweden", EWN="Netherlands", EPU="Peru",
+  ENZL="New Zealand", EIS="Israel", EWO="Austria", EIRL="Ireland", EWK="Belgium"
+)
+tickers_manual <- names(etfs)
+
+price_manual_wk <- get_prices_yahoo(tickers_manual, start = as.Date("2017-03-20"), end = as.Date("2022-03-21"),
+                                 freq = "weekly", price_col = "price.close",
+                                 join = "inner")
+head(price_manual_wk)
+write_csv(price_manual_wk,   "weekly_stock.csv")
+```

@@ -14,6 +14,11 @@ library(httr)
 library(dplyr)
 library(stringr)
 library(readr)
+library(data.table)
+library(furrr)
+library(future)
+library(arrow)
+library(fs)
 ```
 
 ```{r sp500_member}
@@ -63,11 +68,9 @@ get_prices_yahoo <- function(tickers,
                              end   = Sys.Date(),
                              freq  = c("daily","weekly","monthly"),
                              price_col = c("price.adjusted","price.close"),
-                             cache_dir  = file.path(getwd(), "bg_cache"),
-                             join = c("outer","inner")) {
+                             cache_dir  = file.path(getwd(), "bg_cache")) {
   freq      <- match.arg(freq)
   price_col <- match.arg(price_col)
-  join      <- match.arg(join)
 
   bg <- BatchGetSymbols(
     tickers      = unique(tickers),
@@ -75,7 +78,7 @@ get_prices_yahoo <- function(tickers,
     last.date    = end,
     freq.data    = freq,
     cache.folder = cache_dir,      # on-disk cache to avoid re-downloads
-    thresh.bad.data = 0.95         # keep tickers with ≥95% trading days
+    do.cache = TRUE    # Use caching for faster future downloads
   )
 
   prices_long <- bg$df.tickers |>
@@ -88,9 +91,6 @@ get_prices_yahoo <- function(tickers,
     pivot_wider(names_from = ticker, values_from = price) |>
     arrange(date)
 
-  if (join == "inner") {
-    prices_wide <- drop_na(prices_wide)  # keep only dates present for all tickers
-  }
   prices_wide
 }
 ```
@@ -110,8 +110,162 @@ etfs <- c(
 tickers_manual <- names(etfs)
 
 price_manual_wk <- get_prices_yahoo(tickers_manual, start = as.Date("2017-03-20"), end = as.Date("2022-03-21"),
-                                 freq = "weekly", price_col = "price.close",
-                                 join = "inner")
+                                 freq = "weekly", price_col = "price.close")
 head(price_manual_wk)
 write_csv(price_manual_wk,   "weekly_stock.csv")
 ```
+
+```{r}
+####### Download a broad universe of tickers (e.g., stock index and stock exchange #######
+
+symbol_stockindex <- tryCatch({
+  symbol <- c()
+  for (q in tq_index_options()){
+    symbol <- c(symbol, tq_index(q)$symbol)
+  }
+  unique(symbol)
+}, error = function(e) character())
+
+symbol_exchange <- tryCatch({
+  symbol <- c()
+  for (q in tq_exchange_options()){
+    symbol <- c(symbol, tq_exchange(q)$symbol)
+  }
+  unique(symbol)
+}, error = function(e) character())
+tickers_full <- unique(c(symbol_stockindex, symbol_exchange))
+length(tickers_full)  # how many tickers?
+```
+
+```{r}
+start_date <- as.Date("2020-03-01")  # change your COVID cutoff if needed
+price_manual_wk <- get_prices_yahoo(symbol_stockindex, start = start_date, end = Sys.Date(), freq = "weekly", price_col = "price.close")
+price_exchange_wk <- get_prices_yahoo(symbol_exchange, start = start_date, end = Sys.Date(), freq = "weekly", price_col = "price.close")
+```
+
+```{r}
+symbol_index_wk <- colnames(price_manual_wk)[-1]
+symbol_exchange_wk <- colnames(price_exchange_wk)[-1]
+```
+
+```{r}
+start_date <- as.Date("2020-03-01")  # change your COVID cutoff if needed
+price_manual_daily <- get_prices_yahoo(symbol_stockindex, start = start_date, end = Sys.Date(), freq = "daily", price_col = "price.close")
+price_exchange_daily <- get_prices_yahoo(symbol_exchange, start = start_date, end = Sys.Date(), freq = "daily", price_col = "price.close")
+```
+sym
+
+```{r}
+tickers <- tickers_full
+# If you already have a big vector, just assign tickers <- your_vector
+
+start_date <- as.Date("2020-03-01")  # change your COVID cutoff if needed
+
+end_date   <- Sys.Date()
+
+workers        <- max(1, parallel::detectCores() - 1)
+chunk_size     <- 300
+max_retries    <- 3
+pause_between  <- 0.5
+
+out_dir   <- "yahoo_bulk_out"
+cache_dir <- file.path(out_dir, "cache")
+
+
+fs::dir_create(out_dir, recurse = TRUE)
+fs::dir_create(cache_dir, recurse = TRUE)
+
+# ----- chunker -----
+make_chunks <- function(x, chunk_size) {
+  n <- length(x); starts <- seq(1, n, by = chunk_size)
+  lapply(starts, function(s) x[s:min(s + chunk_size - 1, n)])
+}
+
+# EXAMPLE: provide your 7k symbols vector here
+# tickers <- readr::read_lines("tickers_master.txt")
+chunks  <- make_chunks(tickers, chunk_size)
+
+message(sprintf("tickers=%d  chunk_size=%d  n_chunks=%d",
+                length(tickers), chunk_size, length(chunks)))
+
+# ----- worker-safe downloader (all calls are pkg-qualified) -----
+download_chunk <- function(chunk_syms, idx,
+                           start_date, end_date, out_dir, cache_dir,
+                           max_retries, pause_between) {
+  chunk_tag  <- sprintf("chunk_%04d", idx)
+  chunk_file <- file.path(out_dir, paste0(chunk_tag, ".rds"))
+  fail_file  <- file.path(out_dir, paste0(chunk_tag, "_fails.csv"))
+
+  if (fs::file_exists(chunk_file)) {
+    message(chunk_tag, " exists — skipping")
+    return(list(ok = TRUE, file = chunk_file))
+  }
+
+  attempt <- 1
+  last_err <- NULL
+  repeat {
+    message(chunk_tag, " attempt ", attempt, " (", length(chunk_syms), " tickers)")
+    tryres <- try({
+      res <- BatchGetSymbols::BatchGetSymbols(
+        tickers      = chunk_syms,
+        first.date   = start_date,
+        last.date    = end_date,
+        cache.folder = cache_dir,
+        do.parallel  = FALSE,     # outer parallel only
+        max.fail.no  = 100
+      )
+
+      dt_prices  <- data.table::as.data.table(res$df.tickers)
+      dt_control <- data.table::as.data.table(res$df.control)
+
+      if (nrow(dt_control)) {
+        fails <- dt_control[download.status != "OK"]
+        if (nrow(fails)) data.table::fwrite(fails, fail_file)
+      }
+
+      saveRDS(dt_prices, chunk_file)
+      message(chunk_tag, " saved with ", nrow(dt_prices), " rows")
+      list(ok = TRUE, file = chunk_file)
+    }, silent = TRUE)
+
+    if (inherits(tryres, "try-error")) {
+      last_err <- tryres
+      if (attempt >= max_retries) {
+        message(chunk_tag, " failed after ", max_retries, " attempts")
+        readr::write_lines(as.character(last_err), fail_file)
+        return(list(ok = FALSE, file = NULL))
+      }
+      Sys.sleep(pause_between); attempt <- attempt + 1
+    } else {
+      return(tryres)
+    }
+  }
+}
+
+# ----- run in parallel across chunks -----
+plan(multisession, workers = workers)
+on.exit(plan(sequential), add = TRUE)
+
+results <- furrr::future_imap(
+  chunks,
+  ~ download_chunk(.x, .y, start_date, end_date, out_dir, cache_dir, max_retries, pause_between),
+  .progress = TRUE
+)
+
+# ----- collect outputs (no %||%) -----
+rds_files <- vapply(results, function(x) if (is.null(x$file)) NA_character_ else x$file, character(1))
+rds_files <- rds_files[fs::file_exists(rds_files)]
+
+if (!length(rds_files)) stop("No chunk files produced. Check *_fails.csv in ", out_dir)
+
+# ----- combine & write parquet once -----
+all_dt <- data.table::rbindlist(lapply(rds_files, readRDS), use.names = TRUE, fill = TRUE)
+parquet_file <- file.path(out_dir, "prices_since_covid.parquet")
+arrow::write_parquet(all_dt, parquet_file)
+
+message("Done. Rows: ", nrow(all_dt),
+        " | Tickers: ", length(unique(all_dt$ticker)),
+        " | Parquet: ", parquet_file)
+
+```
+

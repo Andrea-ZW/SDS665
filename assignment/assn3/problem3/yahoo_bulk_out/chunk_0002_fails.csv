@@ -1,0 +1,3 @@
+Error in BatchGetSymbols::BatchGetSymbols(tickers = chunk_syms, first.date = start_date,  : 
+  unused argument (max.fail.no = 100)
+
